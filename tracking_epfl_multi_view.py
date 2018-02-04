@@ -55,8 +55,10 @@ def view_to_top(H,xy):
 
 
 class TrackObject:
-    def __init__(self,trackers=None,detector_name='coco-res101',min_confidence=0.8, detection_file = None,  nms_max_overlap=1.0, min_detection_height=0,
-                 max_cosine_distance=0.2, nn_budget=100, display=False):
+    def __init__(self,detector_name='coco-res101',min_confidence=0.8, detection_file = None,  nms_max_overlap=1.0, min_detection_height=0,
+                 max_cosine_distance=0.2, nn_budget=100,view_num=4, display=False):
+        self.pre_multi_next_id = [1]
+        self.multi_next_id = [1]
         self.detection_file= detection_file
         self.min_confidence = min_confidence
         self.nms_max_overlap = nms_max_overlap
@@ -66,9 +68,22 @@ class TrackObject:
         self.display = display
         self.caffeReIDNet = load_ReID_net()
         # self.detector = PedestrianDet(detector_name)
-        self.multi_trackers = trackers
-        self.tracking_results = [{} for i in range(len(trackers))]
-        self.pre_tracking_results = copy.deepcopy(self.tracking_results)
+
+        pre_trackers = []
+        for i in range(view_num):
+            metric = nn_matching.NearestNeighborDistanceMetric("cosine", matching_threshold=0.4, budget=100)
+            pre_trackers.append(Tracker(metric,multi_next_id=self.pre_multi_next_id))
+        self.pre_multi_trackers = pre_trackers
+
+        # trackers = []
+        # for i in range(view_num):
+        #     metric = nn_matching.NearestNeighborDistanceMetric("cosine", matching_threshold=0.4, budget=100)
+        #     trackers.append(Tracker(metric,track_id=self.track_id))
+        self.multi_trackers = copy.deepcopy(self.pre_multi_trackers)
+
+
+        self.pre_tracking_results = [{} for i in range(len(pre_trackers))]
+        self.tracking_results = copy.deepcopy(self.pre_tracking_results)
 
 
     def create_detections(self, detection_mat, frame_idx, min_height=0):
@@ -129,9 +144,9 @@ class TrackObject:
                 detections = self.create_detections(
                     det_fea, frame_idx, self.min_detection_height)
                 self.pre_multi_trackers[view_idx].predict()
-                self.pre_multi_trackers[view_idx].update(detections)
+                self.pre_multi_trackers[view_idx].update(detections,self.pre_multi_next_id)
 
-        for index,tracker_view in enumerate(tracker.pre_multi_trackers):
+        for index,tracker_view in enumerate(self.pre_multi_trackers):
             if len(tracker_view.tracks)<=0:
                 self.pre_tracking_results[index].setdefault(frame_idx, {})
             for track in tracker_view.tracks:
@@ -158,7 +173,7 @@ class TrackObject:
                 indices = preprocessing.non_max_suppression(boxes, self.nms_max_overlap, scores)
                 detections = [detections[i] for i in indices]
                 self.multi_trackers[view_idx].predict()
-                self.multi_trackers[view_idx].update(detections)
+                self.multi_trackers[view_idx].update(detections,self.multi_next_id)
             else:
                 self.multi_trackers[view_idx].predict()
 
@@ -250,17 +265,14 @@ class TrackObject:
                 count+=num
         return assign_matrix
 
-    def ID_match(self,assign_matrix,num_list):
+    def pre_ID_match(self,assign_matrix,num_list):
         tracker_list = []
         # for view_tracker in self.pre_multi_trackers:
         for track in [track for view_tracker in self.pre_multi_trackers for track in view_tracker.tracks]:
             if not track.is_confirmed() or track.time_since_update > 1:
                 continue
             tracker_list.append(track)
-        try:
-            assert len(tracker_list)==sum(num_list),'tracker length is {}, assign matrix is {}'.format(len(tracker_list),sum(num_list))
-        except:
-            pass
+        assert len(tracker_list)==sum(num_list),'tracker length is {}, assign matrix is {}'.format(len(tracker_list),sum(num_list))
         if len(tracker_list)<2:
             return
         temp_matrix = np.unique(assign_matrix,axis=0)
@@ -270,6 +282,37 @@ class TrackObject:
             id = min([tracker_list[index].track_id for index in index_list])
             for index in index_list:
                 tracker_list[index].track_id = id
+        id_list = [tracker_list[index].track_id for index in range(temp_matrix.shape[0])]
+        self.pre_multi_next_id = [max(id_list)+1]
+
+    def ID_match(self,assign_matrix,num_list):
+        tracker_list = []
+        # for view_tracker in self.pre_multi_trackers:
+        for track in [track for view_tracker in self.multi_trackers for track in view_tracker.tracks]:
+            if not track.is_confirmed() or track.time_since_update > 1:
+                continue
+            tracker_list.append(track)
+        assert len(tracker_list)==sum(num_list),'tracker length is {}, assign matrix is {}'.format(len(tracker_list),sum(num_list))
+        if len(tracker_list)<2:
+            return
+        temp_matrix = np.unique(assign_matrix,axis=0)
+        for i in range(temp_matrix.shape[0]):
+            temp = temp_matrix[i]
+            index_list = np.where(temp==1)[0]
+            id = min([tracker_list[index].track_id for index in index_list])
+            for index in index_list:
+                ori_id = tracker_list[index].track_id
+                for view_tracker in self.multi_trackers:
+                    for track in view_tracker.tracks:
+                        if not track == tracker_list[index]:
+                            continue
+                        view_tracker.metric.samples[id] = view_tracker.metric.samples.pop(ori_id)
+                        break
+                tracker_list[index].track_id = id
+
+        id_list = [tracker_list[index].track_id for index in range(temp_matrix.shape[0])]
+        self.multi_next_id = [max(id_list)+1]
+
 
 
 
@@ -285,11 +328,7 @@ if __name__ == "__main__":
     image_dir = [video_dir.format(video) for video in video_list]
     img_list = os.listdir(image_dir[0])
     img_list.sort()
-    tracker_list = []
-    for i in range(len(image_dir)):
-        metric = nn_matching.NearestNeighborDistanceMetric("cosine", matching_threshold=0.4, budget=100)
-        tracker_list.append(Tracker(metric))
-    tracker = TrackObject(tracker_list,detector_name='coco-res101',min_confidence=0.98,min_detection_height=20)
+    tracker = TrackObject(detector_name='coco-res101',min_confidence=0.98,min_detection_height=20,view_num=len(image_dir))
     past = time.time()
 
     result_list = [[] for i in range(len(image_dir))]
@@ -316,23 +355,27 @@ if __name__ == "__main__":
         # detection_result.setdefault(frame_idx,detections)
 
         detections = detection_result[frame_idx]
-        if frame_idx == 400:
+        if frame_idx == 429:
             pass
         for i in range(len(detections)):
             det = detections[i]
             if det is not None and len(det)>0:
                 index = np.where(((det[:,3]-det[:,1])>=min_height) & ((det[:,2]-det[:,0])>=min_width)&(det[:,-1]>=0.98))
                 detections[i] = detections[i][index]
+
         tracker.multi_view_prematching(images,detections,terrace_H())
         dist_data = tracker.generate_sequence()
         dist_matrix,num_list = tracker.cal_distance(dist_data)
         assign_matrix = tracker.assignment_matrix(dist_matrix,num_list)
-        # tracker.ID_match(assign_matrix,num_list)
+        tracker.pre_ID_match(assign_matrix,num_list)
+
+        tracker.multi_view_matching(images, detections)
+        tracker.ID_match(assign_matrix,num_list)
 
         # tracker.assignment_matrix(dist_matrix,num_list)
 
-        tracker.multi_view_matching(images, detections)
-        tracker.draw_trackers(frame_idx, images,True,detections)
+
+        # tracker.draw_trackers(frame_idx, images,True,detections)
 
         # pass
         # tracker.multi_view_prematching(images,detections,terrace_H())
