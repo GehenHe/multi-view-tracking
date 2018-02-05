@@ -55,10 +55,8 @@ def view_to_top(H,xy):
 
 
 class TrackObject:
-    def __init__(self,detector_name='coco-res101',min_confidence=0.8, detection_file = None,  nms_max_overlap=1.0, min_detection_height=0,
-                 max_cosine_distance=0.2, nn_budget=100,view_num=4, display=False):
-        self.pre_multi_next_id = [1]
-        self.multi_next_id = [1]
+    def __init__(self,trackers=None,detector_name='coco-res101',min_confidence=0.8, detection_file = None,  nms_max_overlap=1.0, min_detection_height=0,
+                 max_cosine_distance=0.2, nn_budget=100, view_num = 4,display=False):
         self.detection_file= detection_file
         self.min_confidence = min_confidence
         self.nms_max_overlap = nms_max_overlap
@@ -69,19 +67,22 @@ class TrackObject:
         self.caffeReIDNet = load_ReID_net()
         # self.detector = PedestrianDet(detector_name)
 
+        # global track id
+        self.pre_multi_next_id = [1]
+        self.multi_next_id = [1]
+
+        # map view_id to global id
+        self.pre_id_map = {i:{} for i in range(view_num)}
+        self.id_map = {i:{} for i in range(view_num)}
+
         pre_trackers = []
         for i in range(view_num):
             metric = nn_matching.NearestNeighborDistanceMetric("cosine", matching_threshold=0.4, budget=100)
             pre_trackers.append(Tracker(metric,multi_next_id=self.pre_multi_next_id))
         self.pre_multi_trackers = pre_trackers
-
-        # trackers = []
-        # for i in range(view_num):
-        #     metric = nn_matching.NearestNeighborDistanceMetric("cosine", matching_threshold=0.4, budget=100)
-        #     trackers.append(Tracker(metric,track_id=self.track_id))
         self.multi_trackers = copy.deepcopy(self.pre_multi_trackers)
 
-
+        # save tracking result by {}[view][frame_idx]
         self.pre_tracking_results = [{} for i in range(len(pre_trackers))]
         self.tracking_results = copy.deepcopy(self.pre_tracking_results)
 
@@ -135,6 +136,7 @@ class TrackObject:
 
     def multi_view_prematching(self,images,detection_list,H):
         self.pre_multi_trackers = [self.multi_trackers[i]._copy() for i in range(len(self.multi_trackers))]
+        self.pre_tracking_results = copy.deepcopy(self.tracking_results)
         for view_idx,det_frRCNN in enumerate(detection_list):
             image = images[view_idx]
             if len(det_frRCNN)>0:
@@ -145,8 +147,10 @@ class TrackObject:
                     det_fea, frame_idx, self.min_detection_height)
                 self.pre_multi_trackers[view_idx].predict()
                 self.pre_multi_trackers[view_idx].update(detections,self.pre_multi_next_id)
+            else:
+                self.pre_multi_trackers[view_idx].predict()
 
-        for index,tracker_view in enumerate(self.pre_multi_trackers):
+        for index,tracker_view in enumerate(tracker.pre_multi_trackers):
             if len(tracker_view.tracks)<=0:
                 self.pre_tracking_results[index].setdefault(frame_idx, {})
             for track in tracker_view.tracks:
@@ -159,7 +163,7 @@ class TrackObject:
                 new_xy = view_to_top(H[index],[x,y])
                 self.pre_tracking_results[index].setdefault(frame_idx,{}).setdefault(track.track_id,new_xy)
 
-    def multi_view_matching(self,images,detection_list):
+    def multi_view_matching(self,images,detection_list,H):
         for view_idx,det_frRCNN in enumerate(detection_list):
             image = images[view_idx]
             if det_frRCNN is not None:
@@ -177,12 +181,25 @@ class TrackObject:
             else:
                 self.multi_trackers[view_idx].predict()
 
+        for index,tracker_view in enumerate(tracker.multi_trackers):
+            if len(tracker_view.tracks)<=0:
+                self.pre_tracking_results[index].setdefault(frame_idx, {})
+            for track in tracker_view.tracks:
+                if not track.is_confirmed() or track.time_since_update > 1:
+                    self.pre_tracking_results[index].setdefault(frame_idx, {})
+                    continue
+                bbox = track.to_tlwh()
+                x = int(bbox[0]+bbox[2]/2)
+                y = int(bbox[1]+bbox[3])
+                new_xy = view_to_top(H[index],[x,y])
+                self.tracking_results[index].setdefault(frame_idx,{}).setdefault(track.track_id,new_xy)
+
     def draw_trackers(self,frame_idx,images,is_det=False,detections=None):
         view_num = len(images)
         row_num = np.sqrt(view_num)
         show_list = []
         for view,image in enumerate(images):
-            image_show = draw_tracker(image,self.pre_multi_trackers[view].tracks)
+            image_show = draw_tracker(image,self.multi_trackers[view].tracks,self.id_map[view])
             image_show = cv2.cvtColor(image_show,cv2.COLOR_BGR2RGB)
             if is_det:
                 det = detections[view]
@@ -196,14 +213,16 @@ class TrackObject:
             plt.imshow(image)
         plt.savefig('/home/gehen/PycharmProjects/multi_view_tracking/output/vis_temp/{}.png'.format(frame_idx))
 
-    def generate_sequence(self,queue_length=10):
+    def generate_sequence(self,tracking_results=None,multi_trackers=None,queue_length=10):
         frame_idx = max(self.pre_tracking_results[0].keys())
         start_frame = frame_idx-queue_length
         frame_list = range(start_frame+1,frame_idx+1)
         data = []
-        for view_id,tracker in enumerate(self.pre_tracking_results):
+        pre_tracks_list = []
+        for view_id,tracker in enumerate(tracking_results):
             view_data = []
             id_list = tracker[frame_idx].keys()
+            id_list.sort()
             for id in id_list:
                 id_data = []
                 for frame in frame_list:
@@ -214,9 +233,14 @@ class TrackObject:
                             id_data.append([])
                     except:
                         id_data.append([])
+                temp = [track.track_id for track in multi_trackers[view_id].tracks]
+                temp_index = temp.index(id)
+                track = multi_trackers[view_id].tracks[temp_index]
+                if track.is_confirmed() and track.time_since_update <= 1:
+                    pre_tracks_list.append(track)
                 view_data.append(id_data)
             data.append(view_data)
-        return data
+        return data,pre_tracks_list
 
     def dist_in_seq(self,seq1,seq2,thresh=50):
         dist = 0
@@ -265,53 +289,40 @@ class TrackObject:
                 count+=num
         return assign_matrix
 
-    def pre_ID_match(self,assign_matrix,num_list):
-        tracker_list = []
-        # for view_tracker in self.pre_multi_trackers:
-        for track in [track for view_tracker in self.pre_multi_trackers for track in view_tracker.tracks]:
-            if not track.is_confirmed() or track.time_since_update > 1:
-                continue
-            tracker_list.append(track)
-        assert len(tracker_list)==sum(num_list),'tracker length is {}, assign matrix is {}'.format(len(tracker_list),sum(num_list))
-        if len(tracker_list)<2:
-            return
-        temp_matrix = np.unique(assign_matrix,axis=0)
-        for i in range(temp_matrix.shape[0]):
-            temp = temp_matrix[i]
-            index_list = np.where(temp==1)[0]
-            id = min([tracker_list[index].track_id for index in index_list])
-            for index in index_list:
-                tracker_list[index].track_id = id
-        id_list = [tracker_list[index].track_id for index in range(temp_matrix.shape[0])]
-        self.pre_multi_next_id = [max(id_list)+1]
+    def ID_match(self,assign_matrix,num_list,tracker_list,id_map,_next_id):
+        # tracker_list = []
+        # for track in [track for view_tracker in self.pre_multi_trackers for track in view_tracker.tracks]:
+        #     if not track.is_confirmed() or track.time_since_update > 1:
+        #         continue
+        #     tracker_list.append(track)
 
-    def ID_match(self,assign_matrix,num_list):
-        tracker_list = []
-        # for view_tracker in self.pre_multi_trackers:
-        for track in [track for view_tracker in self.multi_trackers for track in view_tracker.tracks]:
-            if not track.is_confirmed() or track.time_since_update > 1:
-                continue
-            tracker_list.append(track)
         assert len(tracker_list)==sum(num_list),'tracker length is {}, assign matrix is {}'.format(len(tracker_list),sum(num_list))
         if len(tracker_list)<2:
             return
         temp_matrix = np.unique(assign_matrix,axis=0)
         for i in range(temp_matrix.shape[0]):
-            temp = temp_matrix[i]
-            index_list = np.where(temp==1)[0]
-            id = min([tracker_list[index].track_id for index in index_list])
+            item = temp_matrix[i,:]
+            index_list = np.where(item==1)[0]
             for index in index_list:
+                id_map[self.search_view(index,num_list)].setdefault(tracker_list[index].track_id,tracker_list[index].track_id)
+            id = min([id_map[self.search_view(index,num_list)][tracker_list[index].track_id] for index in index_list])
+            for index in index_list:
+                view = self.search_view(index,num_list)
                 ori_id = tracker_list[index].track_id
-                for view_tracker in self.multi_trackers:
-                    for track in view_tracker.tracks:
-                        if not track == tracker_list[index]:
-                            continue
-                        view_tracker.metric.samples[id] = view_tracker.metric.samples.pop(ori_id)
-                        break
-                tracker_list[index].track_id = id
+                id_map.setdefault(view,{})
+                id_map[view][ori_id] = id
+        temp = max([person_id  for view_id in id_map for person_id in id_map[view_id]])
+        _next_id[0] = temp+1
 
-        id_list = [tracker_list[index].track_id for index in range(temp_matrix.shape[0])]
-        self.multi_next_id = [max(id_list)+1]
+
+
+    def search_view(self,index,num_list):
+        index = index+1
+        for i in range(len(num_list)):
+            if index<=sum(num_list[0:i+1]):
+                return i
+
+
 
 
 
@@ -328,7 +339,11 @@ if __name__ == "__main__":
     image_dir = [video_dir.format(video) for video in video_list]
     img_list = os.listdir(image_dir[0])
     img_list.sort()
-    tracker = TrackObject(detector_name='coco-res101',min_confidence=0.98,min_detection_height=20,view_num=len(image_dir))
+    tracker_list = []
+    for i in range(len(image_dir)):
+        metric = nn_matching.NearestNeighborDistanceMetric("cosine", matching_threshold=0.4, budget=100)
+        tracker_list.append(Tracker(metric))
+    tracker = TrackObject(tracker_list,detector_name='coco-res101',min_confidence=0.98,min_detection_height=20,view_num=len(image_dir))
     past = time.time()
 
     result_list = [[] for i in range(len(image_dir))]
@@ -343,7 +358,7 @@ if __name__ == "__main__":
     # with open('/home/gehen/PycharmProjects/multi_view_tracking/data/detection/terrace1-c0.pkl','rb') as f:
     #     detection_result = pickle.load(f)
 
-    for frame_idx,img in enumerate(img_list[390:600]):
+    for frame_idx,img in enumerate(img_list[900:1100]):
         frame_idx = int(img.split('.')[0])
         if frame_idx%100 == 0:
             now = time.time()
@@ -355,27 +370,24 @@ if __name__ == "__main__":
         # detection_result.setdefault(frame_idx,detections)
 
         detections = detection_result[frame_idx]
-        if frame_idx == 429:
+        if frame_idx == 414:
             pass
         for i in range(len(detections)):
             det = detections[i]
             if det is not None and len(det)>0:
                 index = np.where(((det[:,3]-det[:,1])>=min_height) & ((det[:,2]-det[:,0])>=min_width)&(det[:,-1]>=0.98))
                 detections[i] = detections[i][index]
-
         tracker.multi_view_prematching(images,detections,terrace_H())
-        dist_data = tracker.generate_sequence()
+        dist_data,pre_tracks_list = tracker.generate_sequence(tracker.pre_tracking_results,tracker.pre_multi_trackers)
         dist_matrix,num_list = tracker.cal_distance(dist_data)
         assign_matrix = tracker.assignment_matrix(dist_matrix,num_list)
-        tracker.pre_ID_match(assign_matrix,num_list)
-
-        tracker.multi_view_matching(images, detections)
-        tracker.ID_match(assign_matrix,num_list)
+        tracker.ID_match(assign_matrix,num_list,pre_tracks_list,tracker.pre_id_map,tracker.pre_multi_next_id)
 
         # tracker.assignment_matrix(dist_matrix,num_list)
 
-
-        # tracker.draw_trackers(frame_idx, images,True,detections)
+        tracker.multi_view_matching(images, detections,terrace_H())
+        tracker.ID_match(assign_matrix, num_list, pre_tracks_list,tracker.id_map,tracker.multi_next_id)
+        tracker.draw_trackers(frame_idx, images,True,detections)
 
         # pass
         # tracker.multi_view_prematching(images,detections,terrace_H())
@@ -390,18 +402,18 @@ if __name__ == "__main__":
         #         det_gt.append(np.asarray([]))
         # det_gt = det_gt
 
-        for index,tracker_view in enumerate(tracker.pre_multi_trackers):
-            for track in tracker_view.tracks:
-                if not track.is_confirmed() or track.time_since_update > 1:
-                    continue
-                bbox = track.to_tlwh()
-                result_list[index].append([frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3]])
-                person_dict_list[index].setdefault(track.track_id,{}).setdefault(frame_idx,[bbox[0], bbox[1], bbox[2], bbox[3]])
-    # with open('terrace1.pkl','wb') as f:
-    #     pickle.dump(detection_result,f)
-    for idx,video in enumerate(video_list):
-        trk_save_path = os.path.join(save_dir, video + '.txt')
-        f = open(trk_save_path, 'w')
-        result = result_list[idx]
-        for row in result:
-            print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1' % (row[0], row[1], row[2], row[3], row[4], row[5]), file=f)
+    #     for index,tracker_view in enumerate(tracker.pre_multi_trackers):
+    #         for track in tracker_view.tracks:
+    #             if not track.is_confirmed() or track.time_since_update > 1:
+    #                 continue
+    #             bbox = track.to_tlwh()
+    #             result_list[index].append([frame_idx, track.track_id, bbox[0], bbox[1], bbox[2], bbox[3]])
+    #             person_dict_list[index].setdefault(track.track_id,{}).setdefault(frame_idx,[bbox[0], bbox[1], bbox[2], bbox[3]])
+    # # with open('terrace1.pkl','wb') as f:
+    # #     pickle.dump(detection_result,f)
+    # for idx,video in enumerate(video_list):
+    #     trk_save_path = os.path.join(save_dir, video + '.txt')
+    #     f = open(trk_save_path, 'w')
+    #     result = result_list[idx]
+    #     for row in result:
+    #         print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1' % (row[0], row[1], row[2], row[3], row[4], row[5]), file=f)
