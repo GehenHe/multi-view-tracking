@@ -14,7 +14,7 @@ sys.path.append(extract_path)
 
 from seq_info import *
 from extract_per_frame import load_ReID_net, extract
-from preprocess.visualization import draw_tracker
+from preprocess.visualization import draw_tracker,generate_top_view
 from preprocess.homography_matrix import terrace_H
 from application_util import preprocessing
 from application_util import visualization
@@ -52,6 +52,36 @@ def view_to_top(H,xy):
     temp = H*np.mat([xy[0],xy[1],1]).T
     temp = temp/temp[2]
     return temp[0:2]
+
+
+def pred_dot(H,xy,r):
+    m0 = np.asarray(xy).T
+    S0 = np.asarray([[r*r, 0], [0, r*r]])
+    nu = 2
+    k = 1
+    v = []
+    w = []
+    for i in range(nu * 2 + 1):
+        if i == 0:
+            v.append(m0)
+            w.append((float(k) / (k + nu)))
+        elif i <= nu:
+            vi = m0 + np.sqrt((k + nu) * S0)[i - 1].T
+            v.append(vi)
+            w.append(float(k) / (2 * (k + nu)))
+        elif i > nu:
+            vi = m0 - np.sqrt((k + nu) * S0)[i / 2 - 1].T
+            v.append(vi)
+            w.append(float(k) / (2 * (k + nu)))
+    gesai = []
+    for i in range(nu * 2 + 1):
+        temp = np.concatenate((v[i], np.asarray([1]))).reshape(3, 1)
+        gesai_i = H[0:2, :] * temp / (H[2] * temp)
+        gesai.append(gesai_i)
+
+    u0 = sum([gesai[i] * w[i] for i in range(len(gesai))])
+    cov = sum([w[i] * (gesai[i] - u0) * (gesai[i] - u0).reshape(1, 2) for i in range(len(gesai))])
+    return u0,cov
 
 
 class TrackObject:
@@ -146,7 +176,7 @@ class TrackObject:
                 detections = self.create_detections(
                     det_fea, frame_idx, self.min_detection_height)
                 self.pre_multi_trackers[view_idx].predict()
-                self.pre_multi_trackers[view_idx].update(detections,self.pre_multi_next_id)
+                self.pre_multi_trackers[view_idx].update(detections)
             else:
                 self.pre_multi_trackers[view_idx].predict()
 
@@ -154,7 +184,7 @@ class TrackObject:
             if len(tracker_view.tracks)<=0:
                 self.pre_tracking_results[index].setdefault(frame_idx, {})
             for track in tracker_view.tracks:
-                if not track.is_confirmed() or track.time_since_update > 1:
+                if not track.is_confirmed() or track.time_since_update > 1 or track.hit_streak==0:
                     self.pre_tracking_results[index].setdefault(frame_idx, {})
                     continue
                 bbox = track.to_tlwh()
@@ -177,7 +207,7 @@ class TrackObject:
                 indices = preprocessing.non_max_suppression(boxes, self.nms_max_overlap, scores)
                 detections = [detections[i] for i in indices]
                 self.multi_trackers[view_idx].predict()
-                self.multi_trackers[view_idx].update(detections,self.multi_next_id)
+                self.multi_trackers[view_idx].update(detections)
             else:
                 self.multi_trackers[view_idx].predict()
 
@@ -185,8 +215,8 @@ class TrackObject:
             if len(tracker_view.tracks)<=0:
                 self.pre_tracking_results[index].setdefault(frame_idx, {})
             for track in tracker_view.tracks:
-                if not track.is_confirmed() or track.time_since_update > 1:
-                    self.pre_tracking_results[index].setdefault(frame_idx, {})
+                if not track.is_confirmed() or track.time_since_update > 1 or track.hit_streak==0:
+                    self.tracking_results[index].setdefault(frame_idx, {})
                     continue
                 bbox = track.to_tlwh()
                 x = int(bbox[0]+bbox[2]/2)
@@ -212,6 +242,10 @@ class TrackObject:
             plt.axis('off')
             plt.imshow(image)
         plt.savefig('/home/gehen/PycharmProjects/multi_view_tracking/output/vis_temp/{}.png'.format(frame_idx))
+
+    def draw_top_view(self,frame_idx):
+        image = generate_top_view(frame_idx,self.tracking_results)
+        cv2.imwrite('/home/gehen/PycharmProjects/multi_view_tracking/output/top_view/{}.jpg'.format(frame_idx),image)
 
     def generate_sequence(self,tracking_results=None,multi_trackers=None,queue_length=10):
         frame_idx = max(self.pre_tracking_results[0].keys())
@@ -314,17 +348,11 @@ class TrackObject:
         temp = max([person_id  for view_id in id_map for person_id in id_map[view_id]])
         _next_id[0] = temp+1
 
-
-
     def search_view(self,index,num_list):
         index = index+1
         for i in range(len(num_list)):
             if index<=sum(num_list[0:i+1]):
                 return i
-
-
-
-
 
 
 if __name__ == "__main__":
@@ -358,7 +386,7 @@ if __name__ == "__main__":
     # with open('/home/gehen/PycharmProjects/multi_view_tracking/data/detection/terrace1-c0.pkl','rb') as f:
     #     detection_result = pickle.load(f)
 
-    for frame_idx,img in enumerate(img_list[900:1100]):
+    for frame_idx,img in enumerate(img_list[1150:1350]):
         frame_idx = int(img.split('.')[0])
         if frame_idx%100 == 0:
             now = time.time()
@@ -370,7 +398,7 @@ if __name__ == "__main__":
         # detection_result.setdefault(frame_idx,detections)
 
         detections = detection_result[frame_idx]
-        if frame_idx == 414:
+        if frame_idx == 924:
             pass
         for i in range(len(detections)):
             det = detections[i]
@@ -383,11 +411,12 @@ if __name__ == "__main__":
         assign_matrix = tracker.assignment_matrix(dist_matrix,num_list)
         tracker.ID_match(assign_matrix,num_list,pre_tracks_list,tracker.pre_id_map,tracker.pre_multi_next_id)
 
-        # tracker.assignment_matrix(dist_matrix,num_list)
+        tracker.assignment_matrix(dist_matrix,num_list)
 
         tracker.multi_view_matching(images, detections,terrace_H())
         tracker.ID_match(assign_matrix, num_list, pre_tracks_list,tracker.id_map,tracker.multi_next_id)
         tracker.draw_trackers(frame_idx, images,True,detections)
+        tracker.draw_top_view(frame_idx)
 
         # pass
         # tracker.multi_view_prematching(images,detections,terrace_H())

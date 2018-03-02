@@ -37,7 +37,7 @@ class Tracker:
 
     """
 
-    def __init__(self, metric, max_iou_distance=0.7, max_age=50, n_init=3,kf=None,tracks=None,_next_id=None,track_id=None):
+    def __init__(self, metric, max_iou_distance=0.7, max_age=50, n_init=3,kf=None,tracks=None,_next_id=None,multi_next_id=None):
         if tracks is None:
             self.metric = metric
             self.max_iou_distance = max_iou_distance
@@ -45,7 +45,7 @@ class Tracker:
             self.n_init = n_init
             self.kf = kalman_filter.KalmanFilter()
             self.tracks = []
-            self._next_id = track_id
+            self._next_id = 1
         else:
             self.metric = copy.deepcopy(metric)
             self.max_iou_distance = max_iou_distance
@@ -64,7 +64,7 @@ class Tracker:
         for track in self.tracks:
             track.predict(self.kf)
 
-    def update(self, detections,track_id):
+    def update(self, detections):
         """Perform measurement update and track management.
 
         Parameters
@@ -73,7 +73,6 @@ class Tracker:
             A list of detections at the current time step.
 
         """
-        self._next_id = track_id
         # Run matching cascade.
         matches, unmatched_tracks, unmatched_detections = \
             self._match(detections)
@@ -97,6 +96,7 @@ class Tracker:
             features += track.features
             targets += [track.track_id for _ in track.features]
             track.features = []
+
         self.metric.partial_fit(
             np.asarray(features), np.asarray(targets), active_targets)
 
@@ -178,9 +178,9 @@ class Tracker:
     def _initiate_track(self, detection):
         mean, covariance = self.kf.initiate(detection.to_xyah())
         self.tracks.append(Track(
-            mean, covariance, self._next_id[0], self.n_init, self.max_age,
+            mean, covariance, self._next_id, self.n_init, self.max_age,
             detection.feature))
-        self._next_id[0] += 1
+        self._next_id += 1
 
 
     def _copy(self):

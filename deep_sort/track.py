@@ -75,6 +75,7 @@ class Track:
         self.hit_streak = 1
         self.age = 1
         self.time_since_update = 0
+        self.is_miss = False
 
         self.state = TrackState.Tentative
         self.features = []
